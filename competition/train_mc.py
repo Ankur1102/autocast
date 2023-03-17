@@ -126,11 +126,11 @@ if args.train_file is not None:
     # Load into dataset
     train_dataset = Dataset.from_pandas(train_df)
     test_dataset = Dataset.from_pandas(test_df)
+    # cc_news = load_dataset('cc_news', split="train")
     raw_dataset = datasets.DatasetDict({"train": train_dataset, "test": test_dataset})
 
     label_list = raw_dataset["train"].unique("label")
     num_labels = len(label_list)
-    # cc_news = load_dataset('cc_news', split="train")
 
     # Load model and tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
