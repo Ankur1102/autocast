@@ -4,6 +4,29 @@ from typing import Optional, Union
 import torch
 
 @dataclass
+class DataCollatorForSequenceClassification:
+    """
+    Data collator that will dynamically pad the inputs for multiple choice received.
+    """
+
+    tokenizer: PreTrainedTokenizerBase
+    padding: Union[bool, str, PaddingStrategy] = 'longest'
+    max_length: Optional[int] = None
+    pad_to_multiple_of: Optional[int] = None
+
+    def __call__(self, features):
+        label_name = "label" if "label" in features[0].keys() else "labels"
+        labels = [feature.pop(label_name) for feature in features]
+        batch = self.tokenizer.pad(
+            features,
+            padding=self.padding,
+            return_tensors="pt"
+        )
+        # Add back labels
+        batch["labels"] = torch.tensor(labels, dtype=torch.int64)
+        return batch
+
+@dataclass
 class DataCollatorForMultipleChoice:
     """
     Data collator that will dynamically pad the inputs for multiple choice received.
