@@ -15,8 +15,7 @@ import evaluate
 from Collator import *
 from transformers import AutoModel, AutoModelForSequenceClassification, \
     TrainingArguments, Trainer, AutoTokenizer, DataCollatorWithPadding, \
-    AutoModelForMultipleChoice, BigBirdForMultipleChoice
-from helpers import *
+    AutoModelForMultipleChoice, BigBirdForMultipleChoice, pipeline
 
 
 def parse_args():
@@ -143,7 +142,7 @@ raw_dataset = datasets.DatasetDict({"train": train_dataset, "test": test_dataset
 
 # Load model and tokenizer
 tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
-model = AutoModel.from_pretrained(args.model_name_or_path)
+model = AutoModelForSequenceClassification.from_pretrained(args.model_name_or_path)
 if tokenizer.pad_token is None:
     tokenizer.add_special_tokens({'pad_token': '[PAD]'})
     model.resize_token_embeddings(len(tokenizer))
@@ -226,7 +225,13 @@ def show_one(example):
     choices = [choice for choice in example['choices']]
     for choice in choices:
         print(choice)
-    # print(f"Label is {example['answer']}")
+    answer = example["label"]
+    print(f"Actual answer is {answer}")
+
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+    predictions = np.argmax(logits, axis=-1)
+    return metric.compute(predictions=predictions, references=labels)
 
 
 def generate_train_args(output_dir):
@@ -268,33 +273,34 @@ if args.fewshot:
     tuned_trainer.save_model(output_dir=model_path)
 
 
-    # # Evaluate cc_news_bert
-    cc_bert = AutoModelForMultipleChoice.from_pretrained("bert-base-uncased", num_labels=num_labels)
+    # Evaluate cc_news_bert
+    cc_bert = AutoModelForSequenceClassification.from_pretrained("bert-base-uncased", num_labels=num_labels)
     tuned_args = generate_train_args("cc_bert")
     metric = evaluate.load("accuracy")
     cc_bert_trainer = Trainer(model=cc_bert, args=tuned_args,
                               train_dataset=processed_datasets["train"],
-                              eval_dataset=processed_datasets["eval"], compute_metrics=compute_metrics)
+                              eval_dataset=processed_datasets["eval"], compute_metrics=compute_metrics,
+                              data_collator=DataCollatorForSequenceClassification(tokenizer))
 
     metrics = cc_bert_trainer.evaluate()
     cc_bert_trainer.log_metrics("eval", metrics)
-#
-# # # Fine cc_news_bert on t\f questions
-# tuned_model = AutoModelForSequenceClassification.from_pretrained(model_path, num_labels=num_labels)
-# tuned_args = TrainingArguments(output_dir=".", logging_steps=24, save_steps=24, eval_steps=24, save_total_limit=2, metric_for_best_model='accuracy',
-#                            greater_is_better=True, load_best_model_at_end=True,
-#                            evaluation_strategy="steps", per_device_train_batch_size=2,
-#                            gradient_accumulation_steps=8, gradient_checkpointing=True)
-# metric = evaluate.load("accuracy")
-# fine_tune_trainer = Trainer(model=tuned_model, args=tuned_args, train_dataset=processed_datasets["train"].select(range(10)),
-#                             eval_dataset=processed_datasets["eval"].select(range(10)), compute_metrics=compute_metrics)
-# fine_tune_trainer.train()
-# model_path = os.path.join(".", args.output_dir, "fine_tune_bert_tf")
-# fine_tune_trainer.save_model()
-#
+
+# # Fine cc_news_bert on t\f questions
+tuned_model = AutoModelForSequenceClassification.from_pretrained(model_path, num_labels=num_labels)
+tuned_args = TrainingArguments(output_dir=".", logging_steps=24, save_steps=24, eval_steps=24, save_total_limit=2, metric_for_best_model='accuracy',
+                           greater_is_better=True, load_best_model_at_end=True,
+                           evaluation_strategy="steps", per_device_train_batch_size=2,
+                           gradient_accumulation_steps=8, gradient_checkpointing=True)
+metric = evaluate.load("accuracy")
+fine_tune_trainer = Trainer(model=tuned_model, args=tuned_args, train_dataset=processed_datasets["train"].select(range(10)),
+                            eval_dataset=processed_datasets["eval"].select(range(10)), compute_metrics=compute_metrics)
+fine_tune_trainer.train()
+model_path = os.path.join(".", args.output_dir, "fine_tune_bert_tf")
+fine_tune_trainer.save_model()
+
 
 # Fine tune trained model with train set
-tuned_model = AutoModelForSequenceClassification.from_pretrained(args.model_name_or_path, num_labels=num_labels)
+tuned_model = AutoModel.from_pretrained(args.model_name_or_path)
 model_path = os.path.join(".", args.output_dir, "fine_tune_bert_mc")
 tuned_args = generate_train_args(model_path)
 metric = evaluate.load("accuracy")
@@ -308,6 +314,24 @@ fine_tune_trainer.save_metrics("all", metrics)
 fine_tune_trainer.save_model()
 if args.predict:
     preds = fine_tune_trainer.predict()
+
+
+# Testing out model
+example = processed_datasets["train"][5]
+input = tokenizer(example["question"], return_tensors="pt")
+pipe = pipeline("question-answering", model=tuned_model, tokenizer=tokenizer)
+pipe(question=example["question"])
+input["label"] = example["label"]
+accepted_keys = ["input_ids", "attention_mask", "label"]
+features = [{k: v for k, v in input.items() if k in accepted_keys} for i in range(1)]
+inputs = DataCollatorForSequenceClassification(tokenizer)(features)
+with torch.no_grad():
+    logits = tuned_model(**input)
+predicted_class_id = logits.argmax().item()
+print(f"Predicted answer is {tuned_model.config.id2label[predicted_class_id]}")
+show_one(example)
+
+
 
 
 
