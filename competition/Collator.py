@@ -15,15 +15,17 @@ class DataCollatorForSequenceClassification:
     pad_to_multiple_of: Optional[int] = None
 
     def __call__(self, features):
-        label_name = "label" if "label" in features[0].keys() else "labels"
-        labels = [feature.pop(label_name) for feature in features]
+        label_name = "label" if "label" in features[0].keys() else None
+        if label_name is not None:
+            labels = [feature.pop(label_name) for feature in features]
         batch = self.tokenizer.pad(
             features,
             padding=self.padding,
             return_tensors="pt"
         )
         # Add back labels
-        batch["labels"] = torch.tensor(labels, dtype=torch.int64)
+        if label_name is not None:
+           batch["labels"] = torch.tensor(labels, dtype=torch.int64)
         return batch
 
 @dataclass
