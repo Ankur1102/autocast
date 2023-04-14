@@ -61,7 +61,7 @@ def parse_args():
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=5e-5,
+        default=3e-5,
         help="Initial learning rate (after the potential warmup period) to use.",
     )
     parser.add_argument("--weight_decay", type=float, default=0.0, help="Weight decay to use.")
@@ -111,28 +111,10 @@ mc_df = train_data.loc[train_data['qtype'] == "mc"]
 mc_df = mc_df.rename(columns={'answer': 'label'})
 label_list = mc_df.label.unique()
 num_labels = len(label_list)
-# Delete data points that violate max model length
-ind = []
-for i, (x, y) in enumerate(zip(mc_df["question"], mc_df["choices"])):
-    # Get an average length for the choices
-    avg_choice_length = sum(sum([[len(item.split(" "))] for item in y], []))/len(y)
-    # Need question length + choice length to not exceed 512 for model sequence
-    if (len(x.split(" ")) + avg_choice_length + 15) > 512/len(y):
-        ind.append(i)
-mc_df.drop(mc_df.iloc[ind].index, inplace=True)
 # Split training data, to get an evaluation set
 train_df = mc_df.sample(frac=0.8, random_state=25)
 eval_df = mc_df.drop(train_df.index)
 test_df = test_data.loc[test_data['qtype'] == "mc"]
-ind = []
-for i, (x, y) in enumerate(zip(test_df["question"], test_df["choices"])):
-    # Get an average length for the choices
-    avg_choice_length = sum(sum([[len(item.split(" "))] for item in y], []))/len(y)
-    # Need question length + choice length to not exceed 512 for model sequence
-    if (len(x.split(" ")) + avg_choice_length + 15) > 512/len(y):
-        ind.append(i)
-test_df.drop(test_df.iloc[ind].index, inplace=True)
-
 # Load into dataset
 train_dataset = Dataset.from_pandas(train_df)
 eval_dataset = Dataset.from_pandas(eval_df)
@@ -142,11 +124,12 @@ raw_dataset = datasets.DatasetDict({"train": train_dataset, "test": test_dataset
 
 # Load model and tokenizer
 tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
-model = AutoModelForSequenceClassification.from_pretrained(args.model_name_or_path)
+model = AutoModelForSequenceClassification.from_pretrained(args.model_name_or_path, num_labels=num_labels)
 if tokenizer.pad_token is None:
-    tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+    tokenizer.pad_token = tokenizer.eos_token
     model.resize_token_embeddings(len(tokenizer))
-    model.config.pad_token_id = tokenizer.pad_token
+    model.config.pad_token_id = tokenizer.pad_token_id
+
 
 # Pre-process labels
 label_list.sort()
@@ -166,16 +149,10 @@ def process_data(examples):
     
     result = {}
     for i in range(num_examples):
-        choices = examples["choices"][i]
-        num_choices = len(choices)
-        # pad = ["other"] * (num_labels - len(choices))
-        # choices.extend(pad)
-        test = list(zip([examples["question"][i]] * num_choices, choices))
-        sentence = tokenizer.batch_encode_plus(test, padding='longest', truncation=True, return_token_type_ids=False,
-                                               return_attention_mask=False)
-        input_ids = sum([sum(v, []) for k, v in sentence.items()], [])
-        flat_sentence = tokenizer.prepare_for_model(input_ids, padding='longest', truncation=True)
-        for k, v in flat_sentence.items():
+        pairs = [examples["background"][i], examples["question"][i]]
+        encoded_pairs = tokenizer(pairs, padding=False, truncation=True)
+        for k, v in encoded_pairs.items():
+            v = sum(v, [])
             if k not in result:
                 result[k] = []
             result[k].append(v)
@@ -228,6 +205,7 @@ def show_one(example):
     answer = example["label"]
     print(f"Actual answer is {answer}")
 
+
 def compute_metrics(eval_pred):
     logits, labels = eval_pred
     predictions = np.argmax(logits, axis=-1)
@@ -240,11 +218,11 @@ def generate_train_args(output_dir):
     """
 
     if args.train_steps is None:
-        return TrainingArguments(output_dir=output_dir, num_train_epochs=args.num_epochs,
+        return TrainingArguments(output_dir=output_dir, optim='adamw_torch', weight_decay=0.05, num_train_epochs=args.num_epochs,
                                  learning_rate=args.learning_rate, per_device_train_batch_size=args.train_batch,
                                  per_device_eval_batch_size=args.eval_batch, evaluation_strategy="epoch",
-                                 gradient_accumulation_steps=args.gradient_steps, gradient_checkpointing=True,
-                                 metric_for_best_model='accuracy', logging_steps=(args.gradient_steps*2))
+                                 gradient_accumulation_steps=args.gradient_steps, gradient_checkpointing=False,
+                                 metric_for_best_model='accuracy', logging_steps=args.gradient_steps)
     else:
         return TrainingArguments(output_dir=output_dir, num_train_epochs=args.num_epochs,
                                  learning_rate=args.learning_rate, logging_steps=args.train_steps,
@@ -286,50 +264,51 @@ if args.fewshot:
     cc_bert_trainer.log_metrics("eval", metrics)
 
 # # Fine cc_news_bert on t\f questions
-tuned_model = AutoModelForSequenceClassification.from_pretrained(model_path, num_labels=num_labels)
-tuned_args = TrainingArguments(output_dir=".", logging_steps=24, save_steps=24, eval_steps=24, save_total_limit=2, metric_for_best_model='accuracy',
-                           greater_is_better=True, load_best_model_at_end=True,
-                           evaluation_strategy="steps", per_device_train_batch_size=2,
-                           gradient_accumulation_steps=8, gradient_checkpointing=True)
-metric = evaluate.load("accuracy")
-fine_tune_trainer = Trainer(model=tuned_model, args=tuned_args, train_dataset=processed_datasets["train"].select(range(10)),
-                            eval_dataset=processed_datasets["eval"].select(range(10)), compute_metrics=compute_metrics)
-fine_tune_trainer.train()
-model_path = os.path.join(".", args.output_dir, "fine_tune_bert_tf")
-fine_tune_trainer.save_model()
+# tuned_model = AutoModelForSequenceClassification.from_pretrained(model_path, num_labels=num_labels)
+# tuned_args = TrainingArguments(output_dir=".", logging_steps=24, save_steps=24, eval_steps=24, save_total_limit=2, metric_for_best_model='accuracy',
+#                            greater_is_better=True, load_best_model_at_end=True,
+#                            evaluation_strategy="steps", per_device_train_batch_size=2,
+#                            gradient_accumulation_steps=8, gradient_checkpointing=True)
+# metric = evaluate.load("accuracy")
+# fine_tune_trainer = Trainer(model=tuned_model, args=tuned_args, train_dataset=processed_datasets["train"].select(range(10)),
+#                             eval_dataset=processed_datasets["eval"].select(range(10)), compute_metrics=compute_metrics)
+# fine_tune_trainer.train()
+# model_path = os.path.join(".", args.output_dir, "fine_tune_bert_tf")
+# fine_tune_trainer.save_model()
 
 
 # Fine tune trained model with train set
-tuned_model = AutoModel.from_pretrained(args.model_name_or_path)
-model_path = os.path.join(".", args.output_dir, "fine_tune_bert_mc")
+model_path = os.path.join(".", args.output_dir, "GPT")
+model.config.hidden_dropout_prob = 0.5
 tuned_args = generate_train_args(model_path)
 metric = evaluate.load("accuracy")
-fine_tune_trainer = Trainer(model=tuned_model, args=tuned_args, train_dataset=processed_datasets["train"],
+fine_tune_trainer = Trainer(model=model, args=tuned_args, train_dataset=processed_datasets["train"],
                             eval_dataset=processed_datasets["eval"],
                             data_collator=DataCollatorForSequenceClassification(tokenizer), compute_metrics=compute_metrics)
 metrics = fine_tune_trainer.train()
-fine_tune_trainer.log_metrics("all", metrics)
-fine_tune_trainer.save_metrics("all", metrics)
-
+fine_tune_trainer.log_metrics("train", metrics.metrics)
+# metrics = fine_tune_trainer.evaluate()
+# fine_tune_trainer.log_metrics("eval", metrics)
 fine_tune_trainer.save_model()
 if args.predict:
-    preds = fine_tune_trainer.predict()
+    preds = fine_tune_trainer.predict(test_dataset=processed_datasets["test"])
 
 
-# Testing out model
-example = processed_datasets["train"][5]
-input = tokenizer(example["question"], return_tensors="pt")
-pipe = pipeline("question-answering", model=tuned_model, tokenizer=tokenizer)
-pipe(question=example["question"])
-input["label"] = example["label"]
-accepted_keys = ["input_ids", "attention_mask", "label"]
-features = [{k: v for k, v in input.items() if k in accepted_keys} for i in range(1)]
-inputs = DataCollatorForSequenceClassification(tokenizer)(features)
-with torch.no_grad():
-    logits = tuned_model(**input)
-predicted_class_id = logits.argmax().item()
-print(f"Predicted answer is {tuned_model.config.id2label[predicted_class_id]}")
-show_one(example)
+# # Testing out model
+Test = 1
+# example = processed_datasets["train"][5]
+# input = tokenizer(example["question"], return_tensors="pt")
+# pipe = pipeline("question-answering", model=tuned_model, tokenizer=tokenizer)
+# pipe(question=example["question"])
+# input["label"] = example["label"]
+# accepted_keys = ["input_ids", "attention_mask", "label"]
+# features = [{k: v for k, v in input.items() if k in accepted_keys} for i in range(1)]
+# inputs = DataCollatorForSequenceClassification(tokenizer)(features)
+# with torch.no_grad():
+#     logits = tuned_model(**input)
+# predicted_class_id = logits.argmax().item()
+# print(f"Predicted answer is {tuned_model.config.id2label[predicted_class_id]}")
+# show_one(example)
 
 
 
