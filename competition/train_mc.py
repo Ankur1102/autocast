@@ -8,17 +8,19 @@ import numpy as np
 import datasets
 from datasets import load_dataset, load_metric, Dataset
 from torch.utils.data import DataLoader
+from scipy.special import softmax
 from tqdm.auto import tqdm
 import torch
 import torch.nn as nn
 import evaluate
 from Collator import *
+import GPUtil
 from transformers import AutoModel, AutoModelForSequenceClassification, \
     TrainingArguments, Trainer, AutoTokenizer, DataCollatorWithPadding, \
     AutoModelForMultipleChoice, BigBirdForMultipleChoice, pipeline
 
 
-def parse_args():
+def parse():
     parser = argparse.ArgumentParser(description="Train multiple choice questions on a certain model")
 
     parser.add_argument(
@@ -47,6 +49,12 @@ def parse_args():
         help="Batch size (per device) for the training dataloader.",
     )
     parser.add_argument(
+        "--train",
+        action="store",
+        default=False,
+        help="Batch size (per device) for the training dataloader.",
+    )
+    parser.add_argument(
         "--train_batch",
         type=int,
         default=16,
@@ -61,7 +69,7 @@ def parse_args():
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=3e-5,
+        default=5e-5,
         help="Initial learning rate (after the potential warmup period) to use.",
     )
     parser.add_argument("--weight_decay", type=float, default=0.0, help="Weight decay to use.")
@@ -94,27 +102,54 @@ def parse_args():
     return args
 
 
-args = parse_args()
+def cleanData(train_df, test_df):
+    """
+    Takes in a train, test df file and runs steps to clean data
+    """
+    # Drop duplicates
+    train_df = train_df.loc[train_df.astype(str).drop_duplicates().index]
+    test_df = test_df.loc[test_df.astype(str).drop_duplicates().index]
+    
+    # Delete rows where the question is only numbers
+    test_df = test_df[test_df["question"].apply(lambda x: pd.to_numeric(x, errors='coerce')).isna()]
+    train_df = train_df[train_df["question"].apply(lambda x: pd.to_numeric(x, errors='coerce')).isna()]
 
+    # Drop unwanted columns
+    train_df.drop(["prediction_count", "forecaster_count", "crowd"], axis=1, inplace=True)
+
+    # Get test df ids and make sure there is no overlap between train & test data
+    test_id = test_df['id'].tolist()
+    train_id = train_df['id'].tolist()
+    common_ind = [id for id in train_id if id in test_id]
+    train_df = train_df[~train_df.id.isin(common_ind)]
+
+    return train_df, test_df
+
+
+args = parse()
 # Load in datasets
-autocast_questions = json.load(open('train_dataset.json', encoding="utf-8"))  # from the Autocast dataset
-test_questions = json.load(open('test_dataset.json', encoding="utf-8"))
-# Drop indices with nan
-train_data = pd.DataFrame(autocast_questions).dropna()
-test_data = pd.DataFrame(test_questions).dropna()
-# Drop duplicates
-train_data = train_data.loc[train_data.astype(str).drop_duplicates().index]
-test_data = test_data.loc[test_data.astype(str).drop_duplicates().index]
+train_questions = json.load(open('train_dataset.json', encoding="utf-8"))  # from the Autocast dataset
+test_questions = pd.read_csv('autocast_test_set_w_answers.csv', index_col=0, converters={"choices": eval})
+
+#test_questions = json.load(open('test_dataset.json', encoding="utf-8"))
+
+# Read in train set using pandas and automatically drop nan rows
+train_df = pd.DataFrame(train_questions).dropna()
+test_df = test_questions.dropna()
+
+# CLean data from json files
+train_data, test_data = cleanData(train_df, test_df)
 
 # only grab MC questions for now
-mc_df = train_data.loc[train_data['qtype'] == "mc"]
+mc_df = train_data.loc[train_data['qtype'] != "num"]
 mc_df = mc_df.rename(columns={'answer': 'label'})
 label_list = mc_df.label.unique()
 num_labels = len(label_list)
 # Split training data, to get an evaluation set
 train_df = mc_df.sample(frac=0.8, random_state=25)
 eval_df = mc_df.drop(train_df.index)
-test_df = test_data.loc[test_data['qtype'] == "mc"]
+test_df = test_data.loc[test_data['qtype'] != "num"]
+# test_df = test_df.rename(columns={'answers': 'label'})
 # Load into dataset
 train_dataset = Dataset.from_pandas(train_df)
 eval_dataset = Dataset.from_pandas(eval_df)
@@ -123,7 +158,7 @@ cc_news_dataset = load_dataset('cc_news', split="train")
 raw_dataset = datasets.DatasetDict({"train": train_dataset, "test": test_dataset, "eval": eval_dataset})
 
 # Load model and tokenizer
-tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
+tokenizer = AutoTokenizer.from_pretrained("gpt2")
 model = AutoModelForSequenceClassification.from_pretrained(args.model_name_or_path, num_labels=num_labels)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
@@ -149,10 +184,19 @@ def process_data(examples):
     
     result = {}
     for i in range(num_examples):
-        pairs = [examples["background"][i], examples["question"][i]]
-        encoded_pairs = tokenizer(pairs, padding=False, truncation=True)
-        for k, v in encoded_pairs.items():
-            v = sum(v, [])
+        choices = examples["choices"][i]
+        num_choices = len(choices)
+        question = examples["question"][i]
+        background = examples["background"][i]
+        back_ion = [background + question]
+        # pairs = [[f"{background} {question} {choice}"] for choice in choices]
+        # pairs = sum(pairs, [])
+        pairs = tuple(zip(back_ion * num_choices, choices))
+        sentence = tokenizer.batch_encode_plus(pairs, add_special_tokens=True, padding="longest", truncation=False, return_token_type_ids=False,
+                                               return_attention_mask=False, pad_to_multiple_of=9)
+        input_ids = sum([sum(v, []) for k, v in sentence.items()], [])
+        flat_sentence = tokenizer.prepare_for_model(input_ids, padding='longest', truncation=True)
+        for k, v in flat_sentence.items():
             if k not in result:
                 result[k] = []
             result[k].append(v)
@@ -218,7 +262,7 @@ def generate_train_args(output_dir):
     """
 
     if args.train_steps is None:
-        return TrainingArguments(output_dir=output_dir, optim='adamw_torch', weight_decay=0.05, num_train_epochs=args.num_epochs,
+        return TrainingArguments(output_dir=output_dir, optim='adamw_torch', weight_decay=0.1, num_train_epochs=args.num_epochs,
                                  learning_rate=args.learning_rate, per_device_train_batch_size=args.train_batch,
                                  per_device_eval_batch_size=args.eval_batch, evaluation_strategy="epoch",
                                  gradient_accumulation_steps=args.gradient_steps, gradient_checkpointing=False,
@@ -263,52 +307,79 @@ if args.fewshot:
     metrics = cc_bert_trainer.evaluate()
     cc_bert_trainer.log_metrics("eval", metrics)
 
-# # Fine cc_news_bert on t\f questions
-# tuned_model = AutoModelForSequenceClassification.from_pretrained(model_path, num_labels=num_labels)
-# tuned_args = TrainingArguments(output_dir=".", logging_steps=24, save_steps=24, eval_steps=24, save_total_limit=2, metric_for_best_model='accuracy',
-#                            greater_is_better=True, load_best_model_at_end=True,
-#                            evaluation_strategy="steps", per_device_train_batch_size=2,
-#                            gradient_accumulation_steps=8, gradient_checkpointing=True)
-# metric = evaluate.load("accuracy")
-# fine_tune_trainer = Trainer(model=tuned_model, args=tuned_args, train_dataset=processed_datasets["train"].select(range(10)),
-#                             eval_dataset=processed_datasets["eval"].select(range(10)), compute_metrics=compute_metrics)
-# fine_tune_trainer.train()
-# model_path = os.path.join(".", args.output_dir, "fine_tune_bert_tf")
-# fine_tune_trainer.save_model()
-
 
 # Fine tune trained model with train set
 model_path = os.path.join(".", args.output_dir, "GPT")
 model.config.hidden_dropout_prob = 0.5
+model.config.attention_probs_dropout_prob = .5
 tuned_args = generate_train_args(model_path)
 metric = evaluate.load("accuracy")
 fine_tune_trainer = Trainer(model=model, args=tuned_args, train_dataset=processed_datasets["train"],
-                            eval_dataset=processed_datasets["eval"],
+                            eval_dataset=processed_datasets["train"],
                             data_collator=DataCollatorForSequenceClassification(tokenizer), compute_metrics=compute_metrics)
-metrics = fine_tune_trainer.train()
-fine_tune_trainer.log_metrics("train", metrics.metrics)
-# metrics = fine_tune_trainer.evaluate()
-# fine_tune_trainer.log_metrics("eval", metrics)
-fine_tune_trainer.save_model()
+if False:
+    metrics = fine_tune_trainer.train()
+    fine_tune_trainer.save_model()
+    fine_tune_trainer.log_metrics("train", metrics.metrics)
+    train_metrics = fine_tune_trainer.evaluate(eval_dataset=processed_datasets["eval"])
+    fine_tune_trainer.log_metrics("eval", train_metrics)
+    # metrics = fine_tune_trainer.evaluate()
+    # fine_tune_trainer.log_metrics("eval", metrics)
+
 if args.predict:
     preds = fine_tune_trainer.predict(test_dataset=processed_datasets["test"])
+    pred_df = pd.DataFrame(preds.predictions)
+    save_path = os.path.join(model_path, "predictions.csv")
+    pred_df.to_csv(save_path)
+    preds = preds.predictions
+    # preds_df = pd.read_csv(os.path.join(model_path, "predictions.csv"), index_col=0)
+    # preds = preds_df.to_numpy()
+    preds = softmax(preds, axis=1)
 
+    # Run local evaluation
+    def brier_score(probabilities, answer_probabilities):
+        return ((probabilities - answer_probabilities) ** 2).sum() / 2
 
-# # Testing out model
-Test = 1
-# example = processed_datasets["train"][5]
-# input = tokenizer(example["question"], return_tensors="pt")
-# pipe = pipeline("question-answering", model=tuned_model, tokenizer=tokenizer)
-# pipe(question=example["question"])
-# input["label"] = example["label"]
-# accepted_keys = ["input_ids", "attention_mask", "label"]
-# features = [{k: v for k, v in input.items() if k in accepted_keys} for i in range(1)]
-# inputs = DataCollatorForSequenceClassification(tokenizer)(features)
-# with torch.no_grad():
-#     logits = tuned_model(**input)
-# predicted_class_id = logits.argmax().item()
-# print(f"Predicted answer is {tuned_model.config.id2label[predicted_class_id]}")
-# show_one(example)
+    # Read in answers
+    answers = []
+    qtypes = []
+    for question in processed_datasets["test"]:
+        if question['qtype'] == 't/f':
+            # No [1,0]; Yes [0,1]
+            ans_idx = 0 if question['answers'] == 'no' else 1
+            ans = np.zeros(len(question['choices']))
+            ans[ans_idx] = 1
+            qtypes.append('t/f')
+        elif question['qtype'] == 'mc':
+            ans_idx = ord(question['answers']) - ord('A')
+            ans = np.zeros(len(question['choices']))
+            ans[ans_idx] = 1
+            qtypes.append('mc')
+        elif question['qtype'] == 'num':
+            ans = float(question['answers'])
+            qtypes.append('num')
+        answers.append(ans)
+
+    tf_results, mc_results, num_results = [], [], []
+    for i, (p, a, qtype) in enumerate(zip(preds, answers, qtypes)):
+        if qtype == 't/f':
+            p = p[10:]
+            tf_results.append(brier_score(p, a))
+        elif qtype == 'mc':
+            if i>=478:
+                test = 1
+            index = len(processed_datasets["test"][i]["choices"])
+            if index > 12:
+                index = 12
+            p = p[:index]
+            mc_results.append(brier_score(p, a))
+        else:
+            num_results.append(np.abs(p - a))
+        print(i)
+
+    print(
+        f"T/F: {np.mean(tf_results) * 100:.2f}, MCQ: {np.mean(mc_results) * 100:.2f}, NUM: {np.mean(num_results) * 100:.2f}")
+    print(f"Combined Metric: {(np.mean(tf_results) + np.mean(mc_results) + np.mean(num_results)) * 100:.2f}")
 
 
 
